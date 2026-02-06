@@ -12,6 +12,7 @@ using SysInfo;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace ProcessorMonitor
 {
@@ -20,8 +21,163 @@ namespace ProcessorMonitor
         SysInfo.SystemInfo info = new SystemInfo();
         public delegate void MyDelegate();
 
-        Computer c = new Computer();
+        private readonly Computer c = new Computer();
+        private readonly Queue<int> cpuUsageHistory = new Queue<int>();
+        private readonly Queue<float> ramUsageHistory = new Queue<float>();
+        private const int HistoryWindow = 30;
+        private bool hardwareMonitorInitialized;
+        private float lastCpuTemperature;
+        private float lastGpuTemperature;
+        private int peakCpuUsage;
+        private string detectedCpuName = string.Empty;
+        private double detectedCpuTdpMax = 65;
+        private MetroFramework.Controls.MetroLabel cpuTdpCurrentLabel;
+        private MetroFramework.Controls.MetroLabel cpuTdpMaxLabel;
         public int CPUusage { get; set; }
+
+        private sealed class CpuTdpProfile
+        {
+            public CpuTdpProfile(string pattern, string architecture, double maxTdp)
+            {
+                Pattern = pattern;
+                Architecture = architecture;
+                MaxTdp = maxTdp;
+            }
+
+            public string Pattern { get; private set; }
+            public string Architecture { get; private set; }
+            public double MaxTdp { get; private set; }
+        }
+
+        private static readonly List<CpuTdpProfile> KnownTdpProfiles = new List<CpuTdpProfile>
+        {
+            new CpuTdpProfile("intel.*ultra", "Intel Core Ultra", 115),
+            new CpuTdpProfile("intel.*core.*i9", "Intel Core i9", 253),
+            new CpuTdpProfile("intel.*core.*i7", "Intel Core i7", 190),
+            new CpuTdpProfile("intel.*core.*i5", "Intel Core i5", 150),
+            new CpuTdpProfile("intel.*core.*i3", "Intel Core i3", 90),
+            new CpuTdpProfile("intel.*xeon", "Intel Xeon", 350),
+            new CpuTdpProfile("intel.*celeron", "Intel Celeron", 58),
+            new CpuTdpProfile("intel.*pentium", "Intel Pentium", 95),
+            new CpuTdpProfile("amd.*ryzen.*9", "AMD Ryzen 9", 170),
+            new CpuTdpProfile("amd.*ryzen.*7", "AMD Ryzen 7", 170),
+            new CpuTdpProfile("amd.*ryzen.*5", "AMD Ryzen 5", 120),
+            new CpuTdpProfile("amd.*ryzen.*3", "AMD Ryzen 3", 95),
+            new CpuTdpProfile("amd.*threadripper", "AMD Threadripper", 350),
+            new CpuTdpProfile("amd.*epyc", "AMD EPYC", 400),
+            new CpuTdpProfile("amd.*athlon", "AMD Athlon", 95),
+            new CpuTdpProfile("snapdragon|qualcomm", "ARM Snapdragon", 18),
+            new CpuTdpProfile("apple.*m[1-4]", "Apple Silicon M", 60),
+            new CpuTdpProfile("arm|cortex", "ARM Cortex", 45)
+        };
+
+        private void InitializeTdpLabels()
+        {
+            cpuTdpCurrentLabel = new MetroFramework.Controls.MetroLabel();
+            cpuTdpCurrentLabel.AutoSize = true;
+            cpuTdpCurrentLabel.FontWeight = MetroFramework.MetroLabelWeight.Regular;
+            cpuTdpCurrentLabel.Location = new Point(13, 90);
+            cpuTdpCurrentLabel.Text = "TDP (текущий): -- W";
+
+            cpuTdpMaxLabel = new MetroFramework.Controls.MetroLabel();
+            cpuTdpMaxLabel.AutoSize = true;
+            cpuTdpMaxLabel.FontWeight = MetroFramework.MetroLabelWeight.Regular;
+            cpuTdpMaxLabel.Location = new Point(13, 112);
+            cpuTdpMaxLabel.Text = "TDP (макс): -- W";
+
+            RAMTabPage.Controls.Add(cpuTdpCurrentLabel);
+            RAMTabPage.Controls.Add(cpuTdpMaxLabel);
+        }
+
+        private double ResolveCpuMaxTdp(string cpuName)
+        {
+            var normalizedName = (cpuName ?? string.Empty).ToLowerInvariant();
+            foreach (var profile in KnownTdpProfiles)
+            {
+                if (!Regex.IsMatch(normalizedName, profile.Pattern))
+                {
+                    continue;
+                }
+
+                return profile.MaxTdp;
+            }
+
+            return 95;
+        }
+
+        private string ResolveArchitectureName(string cpuName)
+        {
+            var normalizedName = (cpuName ?? string.Empty).ToLowerInvariant();
+            foreach (var profile in KnownTdpProfiles)
+            {
+                if (Regex.IsMatch(normalizedName, profile.Pattern))
+                {
+                    return profile.Architecture;
+                }
+            }
+
+            return "Unknown / mixed";
+        }
+
+        private void UpdateTdpView()
+        {
+            var currentTdp = Math.Round(detectedCpuTdpMax * CPUusage / 100.0, 1);
+            cpuTdpCurrentLabel.Text = string.Format("TDP (текущий): {0:0.0} W", currentTdp);
+            cpuTdpMaxLabel.Text = string.Format("TDP (макс): {0:0.#} W | {1}", detectedCpuTdpMax, ResolveArchitectureName(detectedCpuName));
+        }
+
+        private void EnsureHardwareMonitorInitialized()
+        {
+            if (hardwareMonitorInitialized)
+            {
+                return;
+            }
+
+            c.HDDEnabled = true;
+            c.FanControllerEnabled = true;
+            c.RAMEnabled = true;
+            c.GPUEnabled = true;
+            c.MainboardEnabled = true;
+            c.CPUEnabled = true;
+            c.Open();
+
+            hardwareMonitorInitialized = true;
+        }
+
+        private static double AverageQueue(IEnumerable<int> source)
+        {
+            if (!source.Any())
+            {
+                return 0;
+            }
+
+            return source.Average();
+        }
+
+        private static double AverageQueue(IEnumerable<float> source)
+        {
+            if (!source.Any())
+            {
+                return 0;
+            }
+
+            return source.Average(x => (double)x);
+        }
+
+        private void UpdateHealthBadge()
+        {
+            var cpuTempWarning = lastCpuTemperature >= 80;
+            var gpuTempWarning = lastGpuTemperature >= 80;
+            var usageWarning = CPUusage >= 90;
+
+            if (cpuTempWarning || gpuTempWarning || usageWarning)
+            {
+                Text = "HardwareView · Режим нагрузки 🔥";
+                return;
+            }
+
+            Text = "HardwareView · Система стабильна ✅";
+        }
 
         #region Hardware
         public void hddinfo()
@@ -56,13 +212,15 @@ namespace ProcessorMonitor
             ManagementObjectSearcher searcher =
                     new ManagementObjectSearcher("root\\CIMV2",
                     "SELECT * FROM Win32_Processor");
-            string cpuname;
             foreach (ManagementObject queryObj in searcher.Get())
             {
                 //cpuname = queryObj["Name"].ToString();
                 //cpusocket.Text = cpuname.Replace(" ", "");
-                cpusocket.Text = string.Format("CPU: {0}", queryObj["Name"]);
+                detectedCpuName = Convert.ToString(queryObj["Name"]);
+                cpusocket.Text = string.Format("CPU: {0}", detectedCpuName);
                 Socket.Text = string.Format("Сокет: {0}", queryObj["SocketDesignation"]);
+                detectedCpuTdpMax = ResolveCpuMaxTdp(detectedCpuName);
+                UpdateTdpView();
             }
         }
         public void cache()
@@ -87,9 +245,7 @@ namespace ProcessorMonitor
         }
         public void Voltage()
         {
-            c.CPUEnabled = true;
-            c.MainboardEnabled = true;
-            c.Open();
+            EnsureHardwareMonitorInitialized();
 
             foreach (var hardware in c.Hardware)
             {
@@ -98,11 +254,11 @@ namespace ProcessorMonitor
                 {
                     // This will be in the SuperIO
                     subhardware.Update();
-                    if (subhardware.Sensors.Length > 0) // Index out of bounds check
-                    {
-                        voltagebox.Clear(); ;
-                        foreach (var sensor in subhardware.Sensors)
-                        {
+                                    if (subhardware.Sensors.Length > 0) // Index out of bounds check
+                                    {
+                                        voltagebox.Clear();
+                                        foreach (var sensor in subhardware.Sensors)
+                                        {
                             // Look for the main fan sensor
                             if (sensor.SensorType == SensorType.Voltage)
                             {
@@ -124,13 +280,7 @@ namespace ProcessorMonitor
                 List<string> gpulist = new List<string>();
 
 
-                c.Open();
-                c.HDDEnabled = true;
-                c.FanControllerEnabled = true;
-                c.RAMEnabled = true;
-                c.GPUEnabled = true;
-                c.MainboardEnabled = true;
-                c.CPUEnabled = true;
+                EnsureHardwareMonitorInitialized();
 
                 foreach (var hardware in c.Hardware)
                 {
@@ -144,6 +294,7 @@ namespace ProcessorMonitor
                                 {
                                     tempcpu.Text = (sensors.Value.GetValueOrDefault() + "°C");
                                     circularProgressBar3.Value = (int)sensors.Value;
+                                    lastCpuTemperature = sensors.Value.GetValueOrDefault();
                                 }
                                 if (sensors.SensorType == SensorType.Clock)
                                 {
@@ -194,6 +345,7 @@ namespace ProcessorMonitor
                                         try
                                         {
                                             tempgpu.Text = (sensors.Value.GetValueOrDefault() + "°C");
+                                            lastGpuTemperature = sensors.Value.GetValueOrDefault();
                                         }
                                         catch { }
                                         if (sensors.Max.GetValueOrDefault() > 60)
@@ -333,6 +485,8 @@ namespace ProcessorMonitor
         public Form1()
         {
             InitializeComponent();
+            InitializeTdpLabels();
+            EnsureHardwareMonitorInitialized();
             //Потоки
             backgroundWorker1.RunWorkerAsync();
             backgroundWorker2.RunWorkerAsync();
@@ -369,14 +523,29 @@ namespace ProcessorMonitor
 
             //Проц и оператива
             circularProgressBar1.Value = CPUusage;
-            cpuusage.Text = circularProgressBar1.Value.ToString() + "%";
+            cpuUsageHistory.Enqueue(circularProgressBar1.Value);
+            if (cpuUsageHistory.Count > HistoryWindow)
+            {
+                cpuUsageHistory.Dequeue();
+            }
+
+            peakCpuUsage = Math.Max(peakCpuUsage, circularProgressBar1.Value);
+            cpuusage.Text = string.Format("{0}% | avg {1:0}% | peak {2}%", circularProgressBar1.Value, AverageQueue(cpuUsageHistory), peakCpuUsage);
 
             lblMemoryAvailable.Text = ((int)pcMemoryAvailable.NextValue()).ToString() + " MB";
-            circularProgressBar2.Value = (int)Memory.NextValue();
+            var currentRamUsage = Memory.NextValue();
+            circularProgressBar2.Value = (int)currentRamUsage;
+            ramUsageHistory.Enqueue(currentRamUsage);
+            if (ramUsageHistory.Count > HistoryWindow)
+            {
+                ramUsageHistory.Dequeue();
+            }
 
-            ramproc.Text = Math.Truncate(Memory.NextValue()).ToString() + "%";
+            ramproc.Text = string.Format("{0}% | avg {1:0}%", Math.Truncate(currentRamUsage), AverageQueue(ramUsageHistory));
 
             HDDspeed.Text = (Hddinfo2.NextValue() / 1024 / 1024).ToString("0.###") + " MB/s";
+            UpdateTdpView();
+            UpdateHealthBadge();
         }
 
         private void timer2_Tick(object sender, EventArgs e)
